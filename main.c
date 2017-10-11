@@ -10,13 +10,21 @@
 #include <inttypes.h>
 #include <limits.h>
 
+#ifndef SIZE_MAX
+#define SIZE_MAX (~(size_t)0)
+#endif
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /* for open/close and other file io*/
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
-/*for sendfile (in-kernel file to file copy, very fast) */
+/*for sendfile (in-kernel file to file copy, supposedly very fast) */
 #ifdef USE_SENDFILE
 #include <sys/sendfile.h>
 #endif
@@ -30,7 +38,7 @@
 
 
 #ifdef USE_WRITEV
-#ifndef USE_MMAP  
+#ifndef USE_MMAP
 #error USE_MMAP must be enabled with USE_WRITEV
 #endif
 #include <sys/uio.h>
@@ -45,11 +53,11 @@
 
 
 /* Copied straight from https://fossies.org/dox/gsl-2.2.1/shuffle_8c_source.html*/
-/* Adapted to generate array indices */
+/* Adapted to generate array indices. The returned random indices are in increasing order */
 int gsl_ran_arr_index (const gsl_rng * r, size_t * dest, const size_t k, const size_t n)
 {
   /* Choose k out of n items, return an array x[] of the k items.
-      These items will prevserve the relative order of the original
+      These items will preserve the relative order of the original
       input -- you can use shuffle() to randomize the output if you
       wish */
  
@@ -91,11 +99,17 @@ int write_random_subsample_of_field(int in_fd, int out_fd, off_t in_offset, off_
 #endif
 
   int interrupted=0;
+  
+#ifndef _OPENMP  
   init_my_progressbar(dest_npart,&interrupted);
+#endif
+  
 #ifdef USE_WRITEV
   //vector writes. Loop has to be re-written in units of IOV_MAX
   for(int i=0;i<dest_npart;i+=IOV_MAX) {
+#ifndef _OPENMP        
       my_progressbar(i,&interrupted);//progress-bar will be jumpy
+#endif      
       const int nleft = ((dest_npart - i) > IOV_MAX) ? IOV_MAX:(dest_npart - i);
       struct iovec iov[IOV_MAX];
       for(int j=0;j<nleft;j++){
@@ -109,9 +123,11 @@ int write_random_subsample_of_field(int in_fd, int out_fd, off_t in_offset, off_
       ssize_t bytes_written = writev(out_fd, iov, nleft);
       XRETURN(bytes_written == nleft*itemsize, EXIT_FAILURE, "Expected to write bytes = %zu but wrote %zd instead\n",nleft*itemsize, bytes_written);
   }
-#else  //Not using PWRITEV -> 3 options here i) MMAP + write ii) sendfile iii) pread + write
+#else  //Not using WRITEV -> 3 options here i) MMAP + write ii) sendfile iii) pread + write
   for(int i=0;i<dest_npart;i++) {
+#ifndef _OPENMP        
 	my_progressbar(i,&interrupted);
+#endif    
 	const size_t ind = random_indices[i];
 	size_t offset_in_field = ind * itemsize;
 #if defined(USE_MMAP)
@@ -130,13 +146,15 @@ int write_random_subsample_of_field(int in_fd, int out_fd, off_t in_offset, off_
   }
 #endif //end of WRITEV
 
-
+#ifndef _OPENMP    
   finish_myprogressbar(&interrupted);
+#endif
+  
   return EXIT_SUCCESS;
 }
 
 
-int subsample_single_gadgetfile(const int dest_npart, const char *inputfile, const char *outputfile, const size_t id_bytes, const gsl_rng *rng, const double fraction)
+int subsample_single_gadgetfile(const int dest_npart, const char *inputfile, const char *outputfile, const size_t id_bytes, const gsl_rng *rng, const double fraction, const int64_t nparttotal)
 {
   if(dest_npart <= 0) {
 	fprintf(stderr,"Error: Desired number of particles =%d in the subsampled file must be > 0\n",dest_npart);
@@ -162,7 +180,6 @@ int subsample_single_gadgetfile(const int dest_npart, const char *inputfile, con
 	return EXIT_FAILURE;
   }
   char *in_memblock = mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, in_fd, 0);
-
 #endif
 
 
@@ -248,6 +265,10 @@ int subsample_single_gadgetfile(const int dest_npart, const char *inputfile, con
 
   struct io_header out_hdr = hdr;
   out_hdr.npart[1] = dest_npart;
+  out_hdr.npartTotal[1] = nparttotal;
+  out_hdr.npartTotalHighWord[1] = (nparttotal >> 32);
+  out_hdr.mass[1] /= fraction;
+
   write(out_fd, &dummy1, sizeof(dummy1));
   write(out_fd, &out_hdr, sizeof(struct io_header));
   write(out_fd, &dummy2, sizeof(dummy2));
@@ -293,9 +314,9 @@ int subsample_single_gadgetfile(const int dest_npart, const char *inputfile, con
   write(out_fd, &id_size, sizeof(id_size)); 
   status = write_random_subsample_of_field(in_fd, out_fd, vel_start_offset, -1,dest_npart, id_bytes, random_indices
 #ifdef USE_MMAP
-											   ,in_memblock
+                                           ,in_memblock
 #endif
-											   );
+                                           );
   if(status != EXIT_SUCCESS) {
 	return status;
   }
@@ -320,8 +341,8 @@ int subsample_single_gadgetfile(const int dest_npart, const char *inputfile, con
 	return status;
   }
   current_utc_time(&t1);
-  fprintf(stderr,"Done with file. Total time taken = %8.4lf seconds (pos_time = %6.3e vel_time = %6.3e id_time = %6.3e seconds)\n",REALTIME_ELAPSED_NS(tstart,t1)*1e-9,
-		  pos_time,vel_time,id_time);
+  /* fprintf(stderr,"Done with file. Total time taken = %8.4lf seconds (pos_time = %6.3e vel_time = %6.3e id_time = %6.3e seconds)\n",REALTIME_ELAPSED_NS(tstart,t1)*1e-9, */
+  /*   	  pos_time,vel_time,id_time); */
 
   return EXIT_SUCCESS;
 }
@@ -338,7 +359,7 @@ int main(int argc,char **argv)
   struct timespec tstart,t0,t1;
   int64_t nparticles_written=0,nparticles_withmass=0;
   const gsl_rng_type * rng_type = gsl_rng_ranlxd1;
-  gsl_rng * rng; 
+  gsl_rng * all_procs_rng = gsl_rng_alloc(rng_type);
   unsigned long seed = 42;
   int64_t TotNumPart;
   current_utc_time(&tstart);
@@ -354,7 +375,7 @@ int main(int argc,char **argv)
       else
 		fprintf(stderr,"\t\t <> = `%s' \n",argv[i]);
     }
-    if(i < nargs) {
+    if(i <= nargs) {
       fprintf(stderr,"\nMissing required parameters: \n");
       for(i=argc;i<=nargs;i++)
 		fprintf(stderr,"\t\t %20s = `?'\n",argnames[i-1]);
@@ -378,42 +399,113 @@ int main(int argc,char **argv)
   for(int i=1;i<=nargs;i++) {
 	fprintf(stderr,"\t\t %-25s = %s \n",argnames[i-1],argv[i]);
   }
+#ifdef _OPENMP
+#pragma omp parallel
+  {
+      int nthreads = omp_get_num_threads();
+      int tid = omp_get_thread_num();
+      if(tid == 0)
+          fprintf(stderr,"\t\t %-25s = %d \n","nthreads", nthreads);
+  }
+#endif
   fprintf(stderr,"\t\t ---------------------------------------------\n\n");
 
-  //Setup the rng
-  rng = gsl_rng_alloc(rng_type);
-  gsl_rng_set(rng, seed);
-  size_t id_bytes=0;
+  if(SIZE_MAX != 0xFFFFFFFFFFFFFFFF) {
+      fprintf(stderr,"Error: SIZE_MAX=%zu should be (2^64-1)\n", SIZE_MAX);
+      return EXIT_FAILURE;
+  }
+  
+  size_t id_bytes;
   int interrupted=0;
+  size_t seedtable[nfiles];
+  int64_t nparttotal=0;
+  fprintf(stderr,"Checking all input files ...\n");
   init_my_progressbar(nfiles, &interrupted);
   for(int ifile=0;ifile<nfiles;ifile++) {
-	my_progressbar(ifile,&interrupted);
-	char inputfile[MAXLEN],outputfile[MAXLEN];
-	my_snprintf(inputfile,MAXLEN,"%s.%d",input_filename,ifile);
-	my_snprintf(outputfile, MAXLEN,"%s.%d",output_filename,ifile);
-	if(ifile==0) {
-	  id_bytes = get_gadget_id_bytes(inputfile);
-	  fprintf(stderr,"Gadget ID bytes = %zu\n",id_bytes);
-	}
-	struct io_header hdr = get_gadget_header(inputfile);
-	const int dest_npart = fraction * hdr.npart[1];
-	XRETURN((int) (dest_npart*3*sizeof(float))  < INT_MAX, EXIT_FAILURE, 
-			"Padding bytes will overflow, please reduce the value of fraction (currently, fraction = %lf)\n",fraction);
-	
-	int status = subsample_single_gadgetfile(dest_npart, inputfile, outputfile, id_bytes, rng, fraction);
-	if(status != EXIT_SUCCESS) {
-	  return status;
-	}
-	fprintf(stderr,"Wrote %d subsampled particles out of %d particles (%d/%d files).\n",
-			dest_npart, hdr.npart[1], ifile+1,nfiles);
-	interrupted=1;
+      seedtable[ifile] = SIZE_MAX * gsl_rng_uniform(all_procs_rng);
+      char inputfile[MAXLEN];
+      my_snprintf(inputfile,MAXLEN,"%s.%d",input_filename, ifile);
+      if(ifile == 0) {
+          id_bytes = get_gadget_id_bytes(inputfile);
+          fprintf(stderr,"Gadget ID bytes = %zu\n",id_bytes);
+          interrupted=1;
+      }
+      struct io_header hdr = get_gadget_header(inputfile);
+      const int dest_npart = fraction * hdr.npart[1];
+      XRETURN((int) (dest_npart*3*sizeof(float))  < INT_MAX, EXIT_FAILURE, 
+              "Padding bytes will overflow, please reduce the value of fraction (currently, fraction = %lf)\n",fraction);
+      my_progressbar(ifile,&interrupted);
+      nparttotal += dest_npart;
   }
   finish_myprogressbar(&interrupted);
+  fprintf(stderr,"Checking all input files .....done\n\n");  
 
-  gsl_rng_free(rng);
+  
+  int numdone=0, errorflag=0, savestatus=0;
+  
+  init_my_progressbar(nfiles, &interrupted);
+#ifdef _OPENMP
+#pragma omp parallel shared(numdone, savestatus)
+  {
+      int nthreads = omp_get_num_threads();
+      int tid = omp_get_thread_num();
+#pragma omp for schedule(dynamic)
+#endif      
+      for(int ifile=0;ifile<nfiles;ifile++) {
+          if(errorflag == 0) {
+              //Setup the rng
+              gsl_rng * rng = gsl_rng_alloc(rng_type);
+              gsl_rng_set(rng, seedtable[ifile]);
+
+#ifdef _OPENMP
+#pragma omp atomic
+              numdone++;
+
+              if(tid == 0) 
+#endif              
+                  my_progressbar(numdone,&interrupted);
+              
+              char inputfile[MAXLEN],outputfile[MAXLEN];
+              my_snprintf(inputfile,MAXLEN,"%s.%d",input_filename,ifile);
+              my_snprintf(outputfile, MAXLEN,"%s.%d",output_filename,ifile);
+              struct io_header hdr = get_gadget_header(inputfile);
+              const int dest_npart = fraction * hdr.npart[1];
+              int status = subsample_single_gadgetfile(dest_npart, inputfile, outputfile, id_bytes, rng, fraction, nparttotal);
+              if(status != EXIT_SUCCESS) {
+                  savestatus = status;
+                  errorflag = 1;
+              }
+              gsl_rng_free(rng);
+              
+              /* #ifdef _OPENMP           */
+              /* #pragma omp critical(info) */
+              /*               { */
+              /* #endif */
+              /*                   fprintf(stderr,"Wrote %d subsampled particles out of %d particles (%d/%d files).\n", */
+              /*                           dest_npart, hdr.npart[1], ifile+1,nfiles); */
+              
+              /*                   interrupted=1; */
+              /* #ifdef _OPENMP */
+              /*               }//critical region */
+              /* #endif */
+              
+          }//errorflag == 0 condition
+      }//for loop over nfiles
+      
+#ifdef _OPENMP      
+  }//omp parallel region
+#endif  
+
+  gsl_rng_free(all_procs_rng);
+  finish_myprogressbar(&interrupted);
+
+  if(errorflag != 0) {
+      return savestatus;
+  }
+  
   current_utc_time(&t1);
-  fprintf(stderr,"subsample_Gadget> Done. Wrote %"PRId64" particles to file `%s'. Time taken = %6.2lf seconds\n",
-		  nparticles_written,output_filename,REALTIME_ELAPSED_NS(t1,tstart));
+  fprintf(stderr,"subsample_Gadget> Done. Wrote %"PRId64" particles to file `%s'. Time taken = %6.2lf mins\n",
+		  nparttotal,output_filename,REALTIME_ELAPSED_NS(tstart, t1)*1e-9/60.0);
 
   return EXIT_SUCCESS;
 }
